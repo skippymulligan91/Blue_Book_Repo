@@ -5,6 +5,7 @@
 
 import pandas as pd
 import numpy as np
+from io import StringIO
 from scipy.interpolate import interp1d
 
 # ── Raw GitHub URLs ──────────────────────────────────────────────────────────
@@ -20,10 +21,11 @@ CSV_URL_S275 = (
 # )
 
 
-# ── Module 1 — Load table ────────────────────────────────────────────────────
+# ── Module 1a — Load from URL (local Jupyter) ────────────────────────────────
 def load_ltb_table(url: str = CSV_URL_S275) -> pd.DataFrame:
     """
-    Load LTB capacity table from GitHub raw CSV.
+    Load LTB capacity table directly from GitHub raw CSV URL.
+    Use this in your local Jupyter notebook.
 
     Parameters
     ----------
@@ -36,7 +38,29 @@ def load_ltb_table(url: str = CSV_URL_S275) -> pd.DataFrame:
         Full table with columns: Section, C1, L=1.0 ... L=14.0, Iy_cm4
     """
     df = pd.read_csv(url)
-    df.columns = df.columns.str.strip()  # clean any whitespace in headers
+    df.columns = df.columns.str.strip()
+    return df
+
+
+# ── Module 1b — Load from string (Claude sandbox) ───────────────────────────
+def load_ltb_table_from_string(csv_text: str) -> pd.DataFrame:
+    """
+    Load LTB capacity table from a raw CSV string.
+    Used when pandas cannot reach GitHub directly (e.g. Claude sandbox).
+    Claude fetches the CSV via web_fetch and passes the text here.
+
+    Parameters
+    ----------
+    csv_text : str
+        Raw CSV content as a string
+
+    Returns
+    -------
+    pd.DataFrame
+        Full table with columns: Section, C1, L=1.0 ... L=14.0, Iy_cm4
+    """
+    df = pd.read_csv(StringIO(csv_text))
+    df.columns = df.columns.str.strip()
     return df
 
 
@@ -50,7 +74,7 @@ def get_ltb_row(df: pd.DataFrame, section: str, C1: float) -> pd.Series:
     Parameters
     ----------
     df : pd.DataFrame
-        Full LTB table from load_ltb_table()
+        Full LTB table from load_ltb_table() or load_ltb_table_from_string()
     section : str
         Section designation e.g. "457 x 191 x 82"
     C1 : float
@@ -61,7 +85,6 @@ def get_ltb_row(df: pd.DataFrame, section: str, C1: float) -> pd.Series:
     pd.Series
         Row of Mb,Rd capacities (kNm) indexed by length e.g. "L=1.0" ... "L=14.0"
     """
-    # Filter to requested section
     df_sec = df[df["Section"] == section].copy()
 
     if df_sec.empty:
@@ -70,43 +93,33 @@ def get_ltb_row(df: pd.DataFrame, section: str, C1: float) -> pd.Series:
             f"Check designation format e.g. '457 x 191 x 82'"
         )
 
-    # Available C1 values for this section
-    c1_vals = sorted(df_sec["C1"].unique())
-
-    # Capacity columns only
+    c1_vals  = sorted(df_sec["C1"].unique())
     len_cols = [c for c in df.columns if c.startswith("L=")]
 
     # Exact C1 match
     if C1 in c1_vals:
-        row = df_sec[df_sec["C1"] == C1][len_cols].iloc[0]
-        return row
+        return df_sec[df_sec["C1"] == C1][len_cols].iloc[0]
 
     # C1 below minimum — clamp conservatively
     if C1 < c1_vals[0]:
         print(f"  Warning: C1={C1} below minimum tabulated {c1_vals[0]}. "
               f"Using C1={c1_vals[0]} (conservative)")
-        row = df_sec[df_sec["C1"] == c1_vals[0]][len_cols].iloc[0]
-        return row
+        return df_sec[df_sec["C1"] == c1_vals[0]][len_cols].iloc[0]
 
     # C1 above maximum — clamp at top
     if C1 > c1_vals[-1]:
         print(f"  Warning: C1={C1} above maximum tabulated {c1_vals[-1]}. "
               f"Using C1={c1_vals[-1]}")
-        row = df_sec[df_sec["C1"] == c1_vals[-1]][len_cols].iloc[0]
-        return row
+        return df_sec[df_sec["C1"] == c1_vals[-1]][len_cols].iloc[0]
 
     # Interpolate between two bounding C1 rows
-    c1_lo = max(v for v in c1_vals if v < C1)
-    c1_hi = min(v for v in c1_vals if v > C1)
-
+    c1_lo  = max(v for v in c1_vals if v < C1)
+    c1_hi  = min(v for v in c1_vals if v > C1)
     row_lo = df_sec[df_sec["C1"] == c1_lo][len_cols].iloc[0]
     row_hi = df_sec[df_sec["C1"] == c1_hi][len_cols].iloc[0]
+    t      = (C1 - c1_lo) / (c1_hi - c1_lo)
 
-    # Linear interpolation factor
-    t = (C1 - c1_lo) / (c1_hi - c1_lo)
-    row_interp = row_lo + t * (row_hi - row_lo)
-
-    return row_interp
+    return row_lo + t * (row_hi - row_lo)
 
 
 # ── Module 3 — Interpolate for given length ──────────────────────────────────
@@ -127,30 +140,25 @@ def interpolate_ltb_capacity(row: pd.Series, L: float) -> float:
     float
         Interpolated Mb,Rd (kNm)
     """
-    # Extract tabulated lengths and capacities
     lengths    = np.array([float(c.split("=")[1]) for c in row.index])
     capacities = np.array(row.values, dtype=float)
 
-    # Below minimum — clamp conservatively
     if L < lengths[0]:
         print(f"  Warning: L={L}m below minimum tabulated {lengths[0]}m. "
               f"Using L={lengths[0]}m")
         return float(capacities[0])
 
-    # Above maximum — raise error, no extrapolation
     if L > lengths[-1]:
         raise ValueError(
             f"L={L}m exceeds maximum tabulated length {lengths[-1]}m. "
             f"Table does not extrapolate — check your span."
         )
 
-    # scipy linear interpolation
     f_interp = interp1d(lengths, capacities, kind="linear")
-
     return float(round(float(f_interp(L)), 1))
 
 
-# ── Module 4 — Main callable ─────────────────────────────────────────────────
+# ── Module 4a — Main callable (local Jupyter) ────────────────────────────────
 def lookup_ltb_capacity(
     section: str,
     L: float,
@@ -158,8 +166,8 @@ def lookup_ltb_capacity(
     url: str = CSV_URL_S275
 ) -> dict:
     """
-    Main callable — looks up LTB buckling resistance Mb,Rd for a UB section.
-    Combines table load, C1 interpolation, and length interpolation in one call.
+    Main callable for local Jupyter — looks up LTB buckling resistance Mb,Rd.
+    Fetches CSV directly from GitHub URL.
 
     Parameters
     ----------
@@ -176,11 +184,11 @@ def lookup_ltb_capacity(
     -------
     dict
         {
-          "section"  : str,    # section designation
-          "L"        : float,  # unrestrained length (m)
-          "C1"       : float,  # moment gradient factor used
-          "Mb_Rd"    : float,  # LTB buckling resistance (kNm)
-          "steel"    : str,    # steel grade
+          "section" : str,    # section designation
+          "L"       : float,  # unrestrained length (m)
+          "C1"      : float,  # moment gradient factor used
+          "Mb_Rd"   : float,  # LTB buckling resistance (kNm)
+          "steel"   : str,    # steel grade
         }
 
     Example
@@ -192,12 +200,56 @@ def lookup_ltb_capacity(
     df    = load_ltb_table(url)
     row   = get_ltb_row(df, section, C1)
     Mb_Rd = interpolate_ltb_capacity(row, L)
+    steel = "S355" if "S355" in url else "S275"
 
-    # Infer steel grade from URL
-    if "S355" in url:
-        steel = "S355"
-    else:
-        steel = "S275"
+    return {
+        "section" : section,
+        "L"       : L,
+        "C1"      : C1,
+        "Mb_Rd"   : Mb_Rd,
+        "steel"   : steel,
+    }
+
+
+# ── Module 4b — Main callable (Claude sandbox) ───────────────────────────────
+def lookup_ltb_capacity_from_string(
+    csv_text: str,
+    section: str,
+    L: float,
+    C1: float = 1.0,
+    steel: str = "S275"
+) -> dict:
+    """
+    Main callable for Claude sandbox — looks up LTB buckling resistance Mb,Rd.
+    Accepts raw CSV text string instead of URL (Claude fetches via web_fetch).
+
+    Parameters
+    ----------
+    csv_text : str
+        Raw CSV content fetched via web_fetch
+    section : str
+        Section designation e.g. "457 x 191 x 82"
+    L : float
+        Unrestrained length between restraints (m)
+    C1 : float, optional
+        Moment gradient factor (default 1.0 — uniform moment, conservative)
+    steel : str, optional
+        Steel grade label for output (default "S275")
+
+    Returns
+    -------
+    dict
+        {
+          "section" : str,    # section designation
+          "L"       : float,  # unrestrained length (m)
+          "C1"      : float,  # moment gradient factor used
+          "Mb_Rd"   : float,  # LTB buckling resistance (kNm)
+          "steel"   : str,    # steel grade
+        }
+    """
+    df    = load_ltb_table_from_string(csv_text)
+    row   = get_ltb_row(df, section, C1)
+    Mb_Rd = interpolate_ltb_capacity(row, L)
 
     return {
         "section" : section,
